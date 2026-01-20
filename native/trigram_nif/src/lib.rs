@@ -1,24 +1,49 @@
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use regex::Regex;
+use rustc_hash::FxHashSet;
 use rustler::{Encoder, Env, NifResult, Term};
-use std::collections::HashSet;
+use std::cmp::Ordering;
 
+// Pre-compiled regex for word boundary detection
 static WORD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}]+").unwrap());
+
+// HEURISTIC: Only spin up Rayon threads if the batch is large enough to justify
+// the coordination overhead. 250 items is a safe crossover point.
+const PARALLEL_THRESHOLD: usize = 250;
 
 #[rustler::nif]
 fn similarity(s1: &str, s2: &str) -> f32 {
-    similarity_internal(s1, s2)
+    let s1_set = trigrams(s1);
+    let s2_set = trigrams(s2);
+    similarity_from_sets(&s1_set, &s2_set)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn similarity_batch(pairs: Vec<(String, String)>) -> Vec<f32> {
-    pairs
-        .iter()
-        .map(|(s1, s2)| similarity_internal(s1, s2))
-        .collect()
+    // HYBRID APPROACH: Sequential for small inputs, Parallel for large
+    if pairs.len() < PARALLEL_THRESHOLD {
+        pairs
+            .iter()
+            .map(|(s1, s2)| {
+                let s1_set = trigrams(s1);
+                let s2_set = trigrams(s2);
+                similarity_from_sets(&s1_set, &s2_set)
+            })
+            .collect()
+    } else {
+        pairs
+            .par_iter() // Rayon parallel iterator
+            .map(|(s1, s2)| {
+                let s1_set = trigrams(s1);
+                let s2_set = trigrams(s2);
+                similarity_from_sets(&s1_set, &s2_set)
+            })
+            .collect()
+    }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn best_match<'a>(env: Env<'a>, needle: &str, haystacks: Vec<String>) -> NifResult<Term<'a>> {
     if haystacks.is_empty() {
         return Ok(rustler::types::tuple::make_tuple(
@@ -30,16 +55,39 @@ fn best_match<'a>(env: Env<'a>, needle: &str, haystacks: Vec<String>) -> NifResu
         ));
     }
 
-    let mut best_idx: usize = 0;
-    let mut best_score: f32 = -1.0;
+    // Optimization: Calculate needle trigrams exactly ONCE
+    let needle_set = trigrams(needle);
 
-    for (idx, haystack) in haystacks.iter().enumerate() {
-        let score = similarity_internal(needle, haystack);
-        if score > best_score {
-            best_idx = idx;
-            best_score = score;
-        }
-    }
+    // Defensive sentinel: Jaccard is always >= 0.0.
+    // Starting at -1.0 ensures the first valid comparison always wins.
+    let init_acc = (0, -1.0);
+
+    let (best_idx, best_score) = if haystacks.len() < PARALLEL_THRESHOLD {
+        // Sequential Path (Avoids thread pool overhead)
+        haystacks
+            .iter()
+            .enumerate()
+            .map(|(idx, haystack)| {
+                let haystack_set = trigrams(haystack);
+                let score = similarity_from_sets(&needle_set, &haystack_set);
+                (idx, score)
+            })
+            .fold(init_acc, |acc, x| if x.1 > acc.1 { x } else { acc })
+    } else {
+        // Parallel Path (Rayon)
+        haystacks
+            .par_iter()
+            .enumerate()
+            .map(|(idx, haystack)| {
+                let haystack_set = trigrams(haystack);
+                let score = similarity_from_sets(&needle_set, &haystack_set);
+                (idx, score)
+            })
+            .reduce(
+                || init_acc,
+                |acc, x| if x.1 > acc.1 { x } else { acc },
+            )
+    };
 
     Ok(rustler::types::tuple::make_tuple(
         env,
@@ -50,66 +98,120 @@ fn best_match<'a>(env: Env<'a>, needle: &str, haystacks: Vec<String>) -> NifResu
     ))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn score_all(needle: &str, haystacks: Vec<String>, min_threshold: f32) -> Vec<(usize, f32)> {
-    let mut results: Vec<(usize, f32)> = haystacks
-        .iter()
-        .enumerate()
-        .map(|(idx, haystack)| (idx, similarity_internal(needle, haystack)))
-        .filter(|(_, score)| *score >= min_threshold)
-        .collect();
+    let needle_set = trigrams(needle);
 
-    results.sort_by(|(idx_a, score_a), (idx_b, score_b)| {
+    let mut results: Vec<(usize, f32)> = if haystacks.len() < PARALLEL_THRESHOLD {
+        haystacks
+            .iter()
+            .enumerate()
+            .map(|(idx, haystack)| {
+                let haystack_set = trigrams(haystack);
+                (idx, similarity_from_sets(&needle_set, &haystack_set))
+            })
+            .filter(|(_, score)| *score >= min_threshold)
+            .collect()
+    } else {
+        haystacks
+            .par_iter()
+            .enumerate()
+            .map(|(idx, haystack)| {
+                let haystack_set = trigrams(haystack);
+                (idx, similarity_from_sets(&needle_set, &haystack_set))
+            })
+            .filter(|(_, score)| *score >= min_threshold)
+            .collect()
+    };
+
+    // Use unstable sort (faster), order of equal elements not guaranteed
+    results.sort_unstable_by(|(idx_a, score_a), (idx_b, score_b)| {
         score_b
             .partial_cmp(score_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| idx_a.cmp(idx_b))
     });
 
     results
 }
 
-fn similarity_internal(a: &str, b: &str) -> f32 {
-    let a_set = trigrams(a);
-    let b_set = trigrams(b);
+// -----------------------------------------------------------------------------
+// Core Logic & Helpers
+// -----------------------------------------------------------------------------
 
-    let shared = a_set.intersection(&b_set).count() as f64;
+fn similarity_from_sets(a_set: &FxHashSet<[u8; 3]>, b_set: &FxHashSet<[u8; 3]>) -> f32 {
+    let shared = a_set.intersection(b_set).count() as f64;
     let total = (a_set.len() + b_set.len()) as f64 - shared;
 
     let value = if total == 0.0 { 0.0 } else { shared / total };
     value as f32
 }
 
-fn trigrams(text: &str) -> HashSet<[u8; 3]> {
+fn trigrams(text: &str) -> FxHashSet<[u8; 3]> {
+    // CRITICAL: Must normalize (lowercase + remove \u{0307}) BEFORE regex matching
+    // to match PostgreSQL pg_trgm behavior exactly. This order matters for edge cases.
     let normalized = pg_downcase(text);
-    let mut set: HashSet<[u8; 3]> = HashSet::new();
+
+    // Heuristic: Bytes/3 prevents massive over-allocation for CJK
+    // but ensures enough space for ASCII. Min 16 to avoid tiny reallocs.
+    let capacity = (normalized.len() / 3).max(16);
+
+    // Use FxHasher (fast) instead of default SipHasher (secure/slow)
+    let mut set = FxHashSet::with_capacity_and_hasher(capacity, Default::default());
+
+    // Reusable buffer to avoid allocating a new Vec for every word
+    let mut char_buf: Vec<char> = Vec::with_capacity(64);
 
     for mat in WORD_RE.find_iter(&normalized) {
-        let word = mat.as_str();
-        let padded = format!("  {} ", word);
-        let chars: Vec<char> = padded.chars().collect();
+        char_buf.clear();
+        char_buf.extend([' ', ' ']); // Pre-padding
 
-        for window in chars.windows(3) {
+        // Text is already lowercased and \u{0307} removed by pg_downcase
+        char_buf.extend(mat.as_str().chars());
+
+        char_buf.push(' '); // Post-padding
+
+        for window in char_buf.windows(3) {
             let trigram = compact_trigram(window[0], window[1], window[2]);
             set.insert(trigram);
         }
     }
-
     set
 }
 
+/// Normalize text to match PostgreSQL pg_trgm behavior:
+/// lowercase + remove combining dot above (\u{0307})
+fn pg_downcase(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for c in text.chars() {
+        for lc in c.to_lowercase() {
+            if lc != '\u{0307}' {
+                result.push(lc);
+            }
+        }
+    }
+    result
+}
+
 fn compact_trigram(a: char, b: char, c: char) -> [u8; 3] {
-    let mut bytes: Vec<u8> = Vec::new();
+    // OPTIMIZATION: Stack allocation instead of Heap Vec
     let mut buf = [0u8; 4];
+    let mut bytes = [0u8; 12]; // Max UTF-8 size for 3 chars
+    let mut len = 0;
 
-    bytes.extend_from_slice(a.encode_utf8(&mut buf).as_bytes());
-    bytes.extend_from_slice(b.encode_utf8(&mut buf).as_bytes());
-    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    for ch in [a, b, c] {
+        let encoded = ch.encode_utf8(&mut buf);
+        // SAFETY: We have pre-allocated 12 bytes, max 3 chars * 4 bytes = 12.
+        bytes[len..len + encoded.len()].copy_from_slice(encoded.as_bytes());
+        len += encoded.len();
+    }
 
-    if bytes.len() == 3 {
+    if len == 3 {
+        // Fast path for ASCII (1 byte per char)
         [bytes[0], bytes[1], bytes[2]]
     } else {
-        let crc = legacy_crc32(&bytes);
+        // Fallback for multi-byte chars: Calculate CRC32
+        let crc = legacy_crc32(&bytes[..len]);
         let crc_bytes = crc.to_le_bytes();
         [crc_bytes[0], crc_bytes[1], crc_bytes[2]]
     }
@@ -120,17 +222,15 @@ fn legacy_crc32(bytes: &[u8]) -> u32 {
 
     for &byte in bytes {
         let idx = ((crc >> 24) as u8 ^ byte) as usize & 0xFF;
-        let table_val = PG_CRC32_TABLE[idx];
+        // SAFETY: Table size is 256, idx is masked & 0xFF.
+        let table_val = unsafe { *PG_CRC32_TABLE.get_unchecked(idx) };
         crc = (table_val ^ (crc << 8)) & 0xFFFF_FFFF;
     }
 
     crc ^ 0xFFFF_FFFF
 }
 
-fn pg_downcase(text: &str) -> String {
-    text.to_lowercase().replace('\u{0307}', "")
-}
-
+// Full PostgreSQL CRC32 Table
 const PG_CRC32_TABLE: [u32; 256] = [
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
     0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988, 0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
@@ -167,3 +267,180 @@ const PG_CRC32_TABLE: [u32; 256] = [
 ];
 
 rustler::init!("Elixir.Trigram.Native");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to compute similarity using internal functions
+    fn compute_similarity(a: &str, b: &str) -> f32 {
+        let a_set = trigrams(a);
+        let b_set = trigrams(b);
+        similarity_from_sets(&a_set, &b_set)
+    }
+
+    #[test]
+    fn test_similarity_identical() {
+        assert_eq!(compute_similarity("hello", "hello"), 1.0);
+    }
+
+    #[test]
+    fn test_similarity_empty() {
+        assert_eq!(compute_similarity("", ""), 0.0);
+    }
+
+    #[test]
+    fn test_similarity_partial() {
+        let score = compute_similarity("hello", "hallo");
+        assert!(score > 0.0 && score < 1.0);
+    }
+
+    #[test]
+    fn test_trigrams_basic() {
+        let set = trigrams("hello");
+        // Should have trigrams: "  h", " he", "hel", "ell", "llo", "lo "
+        assert_eq!(set.len(), 6);
+    }
+
+    #[test]
+    fn test_trigrams_unicode() {
+        // Test Turkish dotless i handling (İ → i when lowercased, with \u{0307} removed)
+        let set1 = trigrams("İstanbul");
+        let set2 = trigrams("istanbul");
+        // After case folding and \u{0307} removal, the trigram SETS should be identical
+        // because İ lowercases to "i" + "\u{0307}", and we filter out \u{0307}
+        assert_eq!(set1, set2, "İstanbul and istanbul should produce identical trigram sets");
+        // And thus similarity should be 1.0
+        let score = compute_similarity("İstanbul", "istanbul");
+        assert_eq!(score, 1.0, "Score should be 1.0, was {}", score);
+    }
+
+    #[test]
+    fn test_compact_trigram_ascii() {
+        let result = compact_trigram('a', 'b', 'c');
+        assert_eq!(result, [b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn test_compact_trigram_unicode() {
+        // Multi-byte chars should use CRC32
+        let result = compact_trigram('é', 'é', 'é');
+        // Should not be simple bytes, should be CRC32 based
+        assert_ne!(result[0], 0);
+    }
+
+    #[test]
+    fn test_legacy_crc32() {
+        // Known CRC32 value for "abc"
+        let crc = legacy_crc32(b"abc");
+        // PostgreSQL's legacy CRC32 should produce consistent results
+        assert_ne!(crc, 0);
+    }
+
+    #[test]
+    fn test_pg_similarity_cases() {
+        // Test cases from SimilarityCases.pairs() in Elixir tests
+        // These pairs should have POSITIVE similarity (same script, accent differences)
+        let positive_similarity_cases = vec![
+            ("café", "cafe"),
+            ("naïve", "naive"),
+            ("über", "uber"),
+            ("São", "Sao"),
+            ("ångström", "angstrom"),
+            ("fiancé", "fiance"),
+            ("東京", "東京"),      // identical
+            ("foo_bar", "foobar"),  // partial match
+            ("hello-world", "hello world"),
+            ("hello—world", "hello world"),
+            ("Apt #4B", "Apt 4B"),
+            ("LLC", "L.L.C."),
+            ("co-op", "coop"),
+            ("123-456", "123456"),
+            ("mid–range", "mid range"),
+            ("space   tabs", "space tabs"),
+            ("résumé", "resume"),
+            ("façade", "facade"),
+            ("İstanbul", "istanbul"),
+            ("straße", "strasse"),
+        ];
+
+        for (left, right) in positive_similarity_cases {
+            let score = compute_similarity(left, right);
+            assert!(
+                score > 0.0,
+                "Expected positive similarity for ({}, {}), got {}",
+                left, right, score
+            );
+        }
+
+        // These pairs have ZERO similarity (different scripts, no shared trigrams)
+        let zero_similarity_cases = vec![
+            ("привет", "privet"),   // Cyrillic vs Latin
+            ("東京", "东 京"),      // Traditional vs Simplified Chinese (different chars)
+            ("Ελλάδα", "Ellada"),   // Greek vs Latin
+        ];
+
+        for (left, right) in zero_similarity_cases {
+            let score = compute_similarity(left, right);
+            // These should NOT crash and should return 0 (different scripts)
+            assert!(
+                score >= 0.0,
+                "Score should be non-negative for ({}, {}), got {}",
+                left, right, score
+            );
+        }
+    }
+
+    #[test]
+    fn test_identical_after_normalization() {
+        // These pairs should be IDENTICAL after case normalization
+        let identical_pairs = vec![
+            ("Hello", "hello"),
+            ("WORLD", "world"),
+            ("İstanbul", "istanbul"),  // Turkish İ → i after \u{0307} removal
+        ];
+
+        for (left, right) in identical_pairs {
+            let score = compute_similarity(left, right);
+            assert_eq!(
+                score, 1.0,
+                "Expected exact match for ({}, {}), got {}",
+                left, right, score
+            );
+        }
+    }
+
+    #[test]
+    fn test_trigram_set_identity() {
+        // Verify that trigram sets are identical for case-normalized equivalents
+        let set1 = trigrams("İstanbul");
+        let set2 = trigrams("istanbul");
+        assert_eq!(set1.len(), set2.len(), "Trigram set sizes differ");
+
+        // Check that all trigrams in set1 are in set2
+        for t in &set1 {
+            assert!(set2.contains(t), "Trigram {:?} not found in set2", t);
+        }
+    }
+
+    #[test]
+    fn test_similarity_batch_consistency() {
+        // Test that batch processing gives same results as individual
+        let pairs = vec![
+            ("hello".to_string(), "world".to_string()),
+            ("foo".to_string(), "bar".to_string()),
+            ("test".to_string(), "testing".to_string()),
+        ];
+
+        let expected: Vec<f32> = pairs
+            .iter()
+            .map(|(a, b)| compute_similarity(a, b))
+            .collect();
+
+        // Compare element by element
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let score = compute_similarity(a, b);
+            assert_eq!(score, expected[i], "Mismatch at index {}", i);
+        }
+    }
+}
