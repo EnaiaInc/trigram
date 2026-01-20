@@ -28,8 +28,8 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 if ! git rev-parse "${tag}" >/dev/null 2>&1; then
-  echo "Tag ${tag} not found. Create it and push before running release." >&2
-  exit 1
+  git tag "${tag}"
+  git push origin "${tag}"
 fi
 
 echo "Waiting for release workflow to finish for ${tag}..."
