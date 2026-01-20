@@ -45,6 +45,18 @@ This document outlines the process for creating a new release of Trigram.
    - Go to: https://github.com/EnaiaInc/trigram/actions
    - Wait for all matrix jobs to complete
 
+4. Run the release script (auto-reads version from `mix.exs`):
+
+   ```bash
+   bin/release
+   ```
+
+   To pass flags to Hex publish (for example, `--replace`):
+
+   ```bash
+   bin/release --replace
+   ```
+
 ## Generating Checksums
 
 After the GitHub release is created and all precompiled binaries are uploaded:
