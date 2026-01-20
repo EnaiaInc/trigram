@@ -83,10 +83,7 @@ fn best_match<'a>(env: Env<'a>, needle: &str, haystacks: Vec<String>) -> NifResu
                 let score = similarity_from_sets(&needle_set, &haystack_set);
                 (idx, score)
             })
-            .reduce(
-                || init_acc,
-                |acc, x| if x.1 > acc.1 { x } else { acc },
-            )
+            .reduce(|| init_acc, |acc, x| if x.1 > acc.1 { x } else { acc })
     };
 
     Ok(rustler::types::tuple::make_tuple(
@@ -309,7 +306,10 @@ mod tests {
         let set2 = trigrams("istanbul");
         // After case folding and \u{0307} removal, the trigram SETS should be identical
         // because İ lowercases to "i" + "\u{0307}", and we filter out \u{0307}
-        assert_eq!(set1, set2, "İstanbul and istanbul should produce identical trigram sets");
+        assert_eq!(
+            set1, set2,
+            "İstanbul and istanbul should produce identical trigram sets"
+        );
         // And thus similarity should be 1.0
         let score = compute_similarity("İstanbul", "istanbul");
         assert_eq!(score, 1.0, "Score should be 1.0, was {}", score);
@@ -349,7 +349,7 @@ mod tests {
             ("ångström", "angstrom"),
             ("fiancé", "fiance"),
             ("東京", "東京"),      // identical
-            ("foo_bar", "foobar"),  // partial match
+            ("foo_bar", "foobar"), // partial match
             ("hello-world", "hello world"),
             ("hello—world", "hello world"),
             ("Apt #4B", "Apt 4B"),
@@ -369,15 +369,17 @@ mod tests {
             assert!(
                 score > 0.0,
                 "Expected positive similarity for ({}, {}), got {}",
-                left, right, score
+                left,
+                right,
+                score
             );
         }
 
         // These pairs have ZERO similarity (different scripts, no shared trigrams)
         let zero_similarity_cases = vec![
-            ("привет", "privet"),   // Cyrillic vs Latin
-            ("東京", "东 京"),      // Traditional vs Simplified Chinese (different chars)
-            ("Ελλάδα", "Ellada"),   // Greek vs Latin
+            ("привет", "privet"), // Cyrillic vs Latin
+            ("東京", "东 京"),    // Traditional vs Simplified Chinese (different chars)
+            ("Ελλάδα", "Ellada"), // Greek vs Latin
         ];
 
         for (left, right) in zero_similarity_cases {
@@ -386,7 +388,9 @@ mod tests {
             assert!(
                 score >= 0.0,
                 "Score should be non-negative for ({}, {}), got {}",
-                left, right, score
+                left,
+                right,
+                score
             );
         }
     }
@@ -397,7 +401,7 @@ mod tests {
         let identical_pairs = vec![
             ("Hello", "hello"),
             ("WORLD", "world"),
-            ("İstanbul", "istanbul"),  // Turkish İ → i after \u{0307} removal
+            ("İstanbul", "istanbul"), // Turkish İ → i after \u{0307} removal
         ];
 
         for (left, right) in identical_pairs {
