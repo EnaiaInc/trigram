@@ -46,8 +46,8 @@ max_attempts=30
 sleep_seconds=10
 
 while [[ -z "${run_id}" && "${attempts}" -lt "${max_attempts}" ]]; do
-  run_line=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status,conclusion \
-    | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | \"\\(.databaseId) \\(.status) \\(.conclusion)\"" \
+  run_line=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,workflowName,headBranch,status,conclusion \
+    | jq -r ".[] | select(.workflowName == \"Release\" and .headBranch == \"${tag}\") | \"\\(.databaseId) \\(.status) \\(.conclusion)\"" \
     | head -n 1)
 
   if [[ -n "${run_line}" ]]; then
