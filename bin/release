@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "gh CLI is required" >&2
+  exit 1
+fi
+
+if ! command -v mix >/dev/null 2>&1; then
+  echo "mix is required" >&2
+  exit 1
+fi
+
+cd "$(dirname "$0")/.."
+
+tag=${1:-}
+if [[ -z "${tag}" ]]; then
+  echo "Usage: bin/release vX.Y.Z" >&2
+  exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Working tree is dirty. Commit or stash changes first." >&2
+  exit 1
+fi
+
+if ! git rev-parse "${tag}" >/dev/null 2>&1; then
+  echo "Tag ${tag} not found. Create it and push before running release." >&2
+  exit 1
+fi
+
+echo "Waiting for release workflow to finish for ${tag}..."
+run_id=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status \
+  | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | .databaseId" \
+  | head -n 1)
+
+if [[ -z "${run_id}" ]]; then
+  echo "Release workflow not found for ${tag}." >&2
+  exit 1
+fi
+
+gh run watch "${run_id}" --repo EnaiaInc/trigram
+
+rm -f checksum-Elixir.Trigram.Native.exs
+
+MIX_ENV=prod mix rustler_precompiled.download Trigram.Native --all --print --no-config
+
+if [[ ! -f checksum-Elixir.Trigram.Native.exs ]]; then
+  echo "Checksum file was not generated." >&2
+  exit 1
+fi
+
+MIX_ENV=dev mix hex.publish
