@@ -39,14 +39,22 @@ fi
 
 echo "Waiting for release workflow to finish for ${tag}..."
 run_id=""
+run_status=""
+run_conclusion=""
 attempts=0
 max_attempts=30
 sleep_seconds=10
 
 while [[ -z "${run_id}" && "${attempts}" -lt "${max_attempts}" ]]; do
-  run_id=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status \
-    | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | .databaseId" \
+  run_line=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status,conclusion \
+    | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | \"\\(.databaseId) \\(.status) \\(.conclusion)\"" \
     | head -n 1)
+
+  if [[ -n "${run_line}" ]]; then
+    run_id=$(echo "${run_line}" | awk '{print $1}')
+    run_status=$(echo "${run_line}" | awk '{print $2}')
+    run_conclusion=$(echo "${run_line}" | awk '{print $3}')
+  fi
 
   if [[ -z "${run_id}" ]]; then
     attempts=$((attempts + 1))
@@ -59,7 +67,11 @@ if [[ -z "${run_id}" ]]; then
   exit 1
 fi
 
-gh run watch "${run_id}" --repo EnaiaInc/trigram
+if [[ "${run_status}" == "completed" && "${run_conclusion}" == "success" ]]; then
+  echo "Release workflow already completed successfully for ${tag}."
+else
+  gh run watch "${run_id}" --repo EnaiaInc/trigram
+fi
 
 rm -f checksum-Elixir.Trigram.Native.exs
 
