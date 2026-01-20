@@ -13,11 +13,14 @@ fi
 
 cd "$(dirname "$0")/.."
 
-tag=${1:-}
-if [[ -z "${tag}" ]]; then
-  echo "Usage: bin/release vX.Y.Z" >&2
+version=$(rg -n "@version" mix.exs | sed -n 's/.*@version "\(.*\)".*/\1/p' | head -n 1)
+if [[ -z "${version}" ]]; then
+  echo "Unable to determine version from mix.exs" >&2
   exit 1
 fi
+
+tag="v${version}"
+hex_args=("$@")
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "Working tree is dirty. Commit or stash changes first." >&2
@@ -50,4 +53,4 @@ if [[ ! -f checksum-Elixir.Trigram.Native.exs ]]; then
   exit 1
 fi
 
-MIX_ENV=dev mix hex.publish
+MIX_ENV=dev mix hex.publish "${hex_args[@]}"
