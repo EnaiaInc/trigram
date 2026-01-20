@@ -33,12 +33,24 @@ if ! git rev-parse "${tag}" >/dev/null 2>&1; then
 fi
 
 echo "Waiting for release workflow to finish for ${tag}..."
-run_id=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status \
-  | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | .databaseId" \
-  | head -n 1)
+run_id=""
+attempts=0
+max_attempts=30
+sleep_seconds=10
+
+while [[ -z "${run_id}" && "${attempts}" -lt "${max_attempts}" ]]; do
+  run_id=$(gh run list --repo EnaiaInc/trigram --limit 20 --json databaseId,displayTitle,headBranch,status \
+    | jq -r ".[] | select(.displayTitle == \"Release\" and .headBranch == \"${tag}\") | .databaseId" \
+    | head -n 1)
+
+  if [[ -z "${run_id}" ]]; then
+    attempts=$((attempts + 1))
+    sleep "${sleep_seconds}"
+  fi
+done
 
 if [[ -z "${run_id}" ]]; then
-  echo "Release workflow not found for ${tag}." >&2
+  echo "Release workflow not found for ${tag} after $((max_attempts * sleep_seconds))s." >&2
   exit 1
 fi
 
