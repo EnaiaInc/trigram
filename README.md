@@ -9,7 +9,7 @@ Add the dependency to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:trigram, "~> 0.5.0"}
+    {:trigram, "~> 0.6.0"}
   ]
 end
 ```
